@@ -1,0 +1,13 @@
+# Trivy suppressions for terraform-zcompute-iam-instance-profile module
+# Each suppression includes rationale for audit purposes
+
+# IAM Policy Wildcards
+# This module accepts user-provided policy contents
+# Rationale: Module cannot validate user's policy choices
+# Users are responsible for their own IAM security posture
+AVD-AWS-0057
+
+# IAM Role Trust - EC2 Principal
+# ec2.amazonaws.com is the required principal for instance profiles
+# Rationale: Standard AWS pattern for EC2 instance roles
+AVD-AWS-0342
