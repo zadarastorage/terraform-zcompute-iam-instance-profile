@@ -1,0 +1,466 @@
+name: Cleanup Test Resources
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Weekly Sunday midnight UTC
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run - log what would be deleted'
+        required: false
+        type: boolean
+        default: true
+      max_age_days:
+        description: 'Delete resources older than N days'
+        required: false
+        type: number
+        default: 7
+      require_tag:
+        description: 'Only delete resources with managed-by tag (may not work in zCompute)'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  check-credentials:
+    name: Check Credentials
+    runs-on: ubuntu-latest
+    outputs:
+      has_credentials: ${{ steps.check.outputs.has_credentials }}
+    steps:
+      - name: Check for zCompute credentials
+        id: check
+        env:
+          ZCOMPUTE_ENDPOINT: ${{ secrets.ZCOMPUTE_ENDPOINT }}
+          ZCOMPUTE_ACCESS_KEY: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
+          ZCOMPUTE_SECRET_KEY: ${{ secrets.ZCOMPUTE_SECRET_KEY }}
+        run: |
+          if [ -n "$ZCOMPUTE_ENDPOINT" ] && [ -n "$ZCOMPUTE_ACCESS_KEY" ] && [ -n "$ZCOMPUTE_SECRET_KEY" ]; then
+            echo "has_credentials=true" >> $GITHUB_OUTPUT
+            echo "All zCompute credentials are configured"
+          else
+            echo "has_credentials=false" >> $GITHUB_OUTPUT
+            echo "::warning::Cleanup skipped - zCompute credentials not configured."
+
+            # Log which credentials are missing
+            [ -z "$ZCOMPUTE_ENDPOINT" ] && echo "::warning::Missing secret: ZCOMPUTE_ENDPOINT"
+            [ -z "$ZCOMPUTE_ACCESS_KEY" ] && echo "::warning::Missing secret: ZCOMPUTE_ACCESS_KEY"
+            [ -z "$ZCOMPUTE_SECRET_KEY" ] && echo "::warning::Missing secret: ZCOMPUTE_SECRET_KEY"
+          fi
+
+  cleanup:
+    name: Cleanup Orphaned Resources
+    runs-on: ubuntu-latest
+    needs: check-credentials
+    if: needs.check-credentials.outputs.has_credentials == 'true'
+    env:
+      AWS_ENDPOINT_URL: ${{ secrets.ZCOMPUTE_ENDPOINT }}/api/v2/aws/iam
+      AWS_ACCESS_KEY_ID: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.ZCOMPUTE_SECRET_KEY }}
+      AWS_REGION: us-east-1
+      AWS_EC2_METADATA_DISABLED: true
+      DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+      MAX_AGE_DAYS: ${{ github.event.inputs.max_age_days || '7' }}
+      REQUIRE_TAG: ${{ github.event.inputs.require_tag || 'false' }}
+    steps:
+      - name: Initialize counters
+        id: init
+        run: |
+          echo "PROFILES_SCANNED=0" >> $GITHUB_ENV
+          echo "PROFILES_DELETED=0" >> $GITHUB_ENV
+          echo "ROLES_SCANNED=0" >> $GITHUB_ENV
+          echo "ROLES_DELETED=0" >> $GITHUB_ENV
+          echo "POLICIES_SCANNED=0" >> $GITHUB_ENV
+          echo "POLICIES_DELETED=0" >> $GITHUB_ENV
+          echo "ERRORS=0" >> $GITHUB_ENV
+          echo "TAG_CHECK_FAILED=false" >> $GITHUB_ENV
+
+          echo "## Cleanup Test Resources" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Dry run: $DRY_RUN" >> $GITHUB_STEP_SUMMARY
+          echo "- Max age: $MAX_AGE_DAYS days" >> $GITHUB_STEP_SUMMARY
+          echo "- Require tag: $REQUIRE_TAG" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup old instance profiles
+        id: cleanup-profiles
+        run: |
+          echo "### Instance Profiles" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "Scanning for orphaned instance profiles (prefix: test-, older than $MAX_AGE_DAYS days)"
+
+          # Get current time in seconds since epoch
+          CURRENT_TIME=$(date +%s)
+
+          # List all instance profiles
+          PROFILES_JSON=$(aws iam list-instance-profiles --output json --no-verify-ssl 2>/dev/null || echo '{"InstanceProfiles":[]}')
+
+          # Filter for names starting with "test-"
+          PROFILES=$(echo "$PROFILES_JSON" | jq -r '.InstanceProfiles[] | select(.InstanceProfileName | startswith("test-")) | .InstanceProfileName')
+
+          if [ -z "$PROFILES" ]; then
+            echo "No test instance profiles found"
+            echo "No test-* instance profiles found." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          SCANNED=0
+          DELETED=0
+
+          for PROFILE in $PROFILES; do
+            SCANNED=$((SCANNED + 1))
+
+            # Get profile details including creation date
+            PROFILE_INFO=$(aws iam get-instance-profile --instance-profile-name "$PROFILE" --output json --no-verify-ssl 2>/dev/null || echo '{}')
+            CREATE_DATE=$(echo "$PROFILE_INFO" | jq -r '.InstanceProfile.CreateDate // ""')
+
+            if [ -z "$CREATE_DATE" ]; then
+              echo "::warning::Could not get creation date for profile: $PROFILE"
+              continue
+            fi
+
+            # Calculate age in days
+            CREATE_EPOCH=$(date -d "$CREATE_DATE" +%s 2>/dev/null || echo "0")
+            if [ "$CREATE_EPOCH" = "0" ]; then
+              echo "::warning::Could not parse creation date for profile: $PROFILE"
+              continue
+            fi
+            AGE_DAYS=$(( (CURRENT_TIME - CREATE_EPOCH) / 86400 ))
+
+            echo "Found: $PROFILE (age: $AGE_DAYS days)"
+
+            # Check tag if required
+            if [ "$REQUIRE_TAG" = "true" ]; then
+              # Attempt to check for managed-by tag
+              TAGS=$(aws iam list-instance-profile-tags --instance-profile-name "$PROFILE" --output json --no-verify-ssl 2>&1 || echo "TAG_ERROR")
+
+              if echo "$TAGS" | grep -q "TAG_ERROR\|error\|Error\|not supported\|InvalidAction"; then
+                if [ "$TAG_CHECK_FAILED" = "false" ]; then
+                  echo "::warning::Tag check not supported in zCompute, falling back to naming convention only"
+                  echo "TAG_CHECK_FAILED=true" >> $GITHUB_ENV
+                fi
+                echo "Skipping $PROFILE - require_tag is set but tag check not supported"
+                continue
+              fi
+
+              HAS_TAG=$(echo "$TAGS" | jq -r '.Tags[] | select(.Key == "managed-by" and .Value == "integration-test") | .Key' 2>/dev/null || echo "")
+              if [ -z "$HAS_TAG" ]; then
+                echo "Skipping $PROFILE - does not have managed-by tag"
+                continue
+              fi
+            fi
+
+            # Check age threshold
+            if [ $AGE_DAYS -gt $MAX_AGE_DAYS ]; then
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "Would delete: $PROFILE (age: $AGE_DAYS days)"
+                echo "- Would delete: \`$PROFILE\` (age: $AGE_DAYS days)" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "Deleting instance profile: $PROFILE"
+
+                # First, remove any roles from the profile
+                ROLES_IN_PROFILE=$(echo "$PROFILE_INFO" | jq -r '.InstanceProfile.Roles[].RoleName // empty')
+                for ROLE in $ROLES_IN_PROFILE; do
+                  echo "  Removing role $ROLE from profile $PROFILE"
+                  aws iam remove-role-from-instance-profile \
+                    --instance-profile-name "$PROFILE" \
+                    --role-name "$ROLE" \
+                    --no-verify-ssl 2>/dev/null || true
+                done
+
+                # Delete the profile
+                if aws iam delete-instance-profile --instance-profile-name "$PROFILE" --no-verify-ssl 2>/dev/null; then
+                  echo "Deleted: $PROFILE"
+                  echo "- Deleted: \`$PROFILE\` (age: $AGE_DAYS days)" >> $GITHUB_STEP_SUMMARY
+                  DELETED=$((DELETED + 1))
+                else
+                  echo "::warning::Failed to delete instance profile: $PROFILE"
+                  echo "ERRORS=$((ERRORS + 1))" >> $GITHUB_ENV
+                fi
+              fi
+            else
+              echo "Keeping: $PROFILE (age: $AGE_DAYS days, threshold: $MAX_AGE_DAYS days)"
+            fi
+          done
+
+          echo "PROFILES_SCANNED=$SCANNED" >> $GITHUB_ENV
+          echo "PROFILES_DELETED=$DELETED" >> $GITHUB_ENV
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup old roles
+        id: cleanup-roles
+        run: |
+          echo "### Roles" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "Scanning for orphaned roles (prefix: test-role-, older than $MAX_AGE_DAYS days)"
+
+          CURRENT_TIME=$(date +%s)
+
+          # List all roles
+          ROLES_JSON=$(aws iam list-roles --output json --no-verify-ssl 2>/dev/null || echo '{"Roles":[]}')
+
+          # Filter for names starting with "test-role-"
+          ROLES=$(echo "$ROLES_JSON" | jq -r '.Roles[] | select(.RoleName | startswith("test-role-")) | .RoleName')
+
+          if [ -z "$ROLES" ]; then
+            echo "No test roles found"
+            echo "No test-role-* roles found." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          SCANNED=0
+          DELETED=0
+
+          for ROLE in $ROLES; do
+            SCANNED=$((SCANNED + 1))
+
+            # Get role details
+            ROLE_INFO=$(aws iam get-role --role-name "$ROLE" --output json --no-verify-ssl 2>/dev/null || echo '{}')
+            CREATE_DATE=$(echo "$ROLE_INFO" | jq -r '.Role.CreateDate // ""')
+
+            if [ -z "$CREATE_DATE" ]; then
+              echo "::warning::Could not get creation date for role: $ROLE"
+              continue
+            fi
+
+            CREATE_EPOCH=$(date -d "$CREATE_DATE" +%s 2>/dev/null || echo "0")
+            if [ "$CREATE_EPOCH" = "0" ]; then
+              echo "::warning::Could not parse creation date for role: $ROLE"
+              continue
+            fi
+            AGE_DAYS=$(( (CURRENT_TIME - CREATE_EPOCH) / 86400 ))
+
+            echo "Found: $ROLE (age: $AGE_DAYS days)"
+
+            # Check tag if required
+            if [ "$REQUIRE_TAG" = "true" ]; then
+              TAGS=$(aws iam list-role-tags --role-name "$ROLE" --output json --no-verify-ssl 2>&1 || echo "TAG_ERROR")
+
+              if echo "$TAGS" | grep -q "TAG_ERROR\|error\|Error\|not supported\|InvalidAction"; then
+                if [ "$TAG_CHECK_FAILED" = "false" ]; then
+                  echo "::warning::Tag check not supported in zCompute, falling back to naming convention only"
+                  echo "TAG_CHECK_FAILED=true" >> $GITHUB_ENV
+                fi
+                echo "Skipping $ROLE - require_tag is set but tag check not supported"
+                continue
+              fi
+
+              HAS_TAG=$(echo "$TAGS" | jq -r '.Tags[] | select(.Key == "managed-by" and .Value == "integration-test") | .Key' 2>/dev/null || echo "")
+              if [ -z "$HAS_TAG" ]; then
+                echo "Skipping $ROLE - does not have managed-by tag"
+                continue
+              fi
+            fi
+
+            # Check age threshold
+            if [ $AGE_DAYS -gt $MAX_AGE_DAYS ]; then
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "Would delete: $ROLE (age: $AGE_DAYS days)"
+                echo "- Would delete: \`$ROLE\` (age: $AGE_DAYS days)" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "Deleting role: $ROLE"
+
+                # First, detach all managed policies
+                ATTACHED=$(aws iam list-attached-role-policies --role-name "$ROLE" --output json --no-verify-ssl 2>/dev/null || echo '{"AttachedPolicies":[]}')
+                POLICY_ARNS=$(echo "$ATTACHED" | jq -r '.AttachedPolicies[].PolicyArn // empty')
+                for POLICY_ARN in $POLICY_ARNS; do
+                  echo "  Detaching policy $POLICY_ARN from role $ROLE"
+                  aws iam detach-role-policy \
+                    --role-name "$ROLE" \
+                    --policy-arn "$POLICY_ARN" \
+                    --no-verify-ssl 2>/dev/null || true
+                done
+
+                # Delete inline policies
+                INLINE=$(aws iam list-role-policies --role-name "$ROLE" --output json --no-verify-ssl 2>/dev/null || echo '{"PolicyNames":[]}')
+                INLINE_NAMES=$(echo "$INLINE" | jq -r '.PolicyNames[] // empty')
+                for POLICY_NAME in $INLINE_NAMES; do
+                  echo "  Deleting inline policy $POLICY_NAME from role $ROLE"
+                  aws iam delete-role-policy \
+                    --role-name "$ROLE" \
+                    --policy-name "$POLICY_NAME" \
+                    --no-verify-ssl 2>/dev/null || true
+                done
+
+                # Delete the role
+                if aws iam delete-role --role-name "$ROLE" --no-verify-ssl 2>/dev/null; then
+                  echo "Deleted: $ROLE"
+                  echo "- Deleted: \`$ROLE\` (age: $AGE_DAYS days)" >> $GITHUB_STEP_SUMMARY
+                  DELETED=$((DELETED + 1))
+                else
+                  echo "::warning::Failed to delete role: $ROLE"
+                  echo "ERRORS=$((ERRORS + 1))" >> $GITHUB_ENV
+                fi
+              fi
+            else
+              echo "Keeping: $ROLE (age: $AGE_DAYS days, threshold: $MAX_AGE_DAYS days)"
+            fi
+          done
+
+          echo "ROLES_SCANNED=$SCANNED" >> $GITHUB_ENV
+          echo "ROLES_DELETED=$DELETED" >> $GITHUB_ENV
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cleanup old policies
+        id: cleanup-policies
+        run: |
+          echo "### Policies" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          echo "Scanning for orphaned policies (prefix: test-policy-, older than $MAX_AGE_DAYS days)"
+
+          CURRENT_TIME=$(date +%s)
+
+          # List all local (customer-managed) policies
+          POLICIES_JSON=$(aws iam list-policies --scope Local --output json --no-verify-ssl 2>/dev/null || echo '{"Policies":[]}')
+
+          # Filter for names starting with "test-policy-"
+          # Note: IAM module adds hash suffix, so we match on prefix
+          POLICIES=$(echo "$POLICIES_JSON" | jq -r '.Policies[] | select(.PolicyName | startswith("test-policy-")) | "\(.PolicyName)|\(.Arn)"')
+
+          if [ -z "$POLICIES" ]; then
+            echo "No test policies found"
+            echo "No test-policy-* policies found." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          fi
+
+          SCANNED=0
+          DELETED=0
+
+          echo "$POLICIES" | while IFS='|' read -r POLICY_NAME POLICY_ARN; do
+            [ -z "$POLICY_NAME" ] && continue
+            SCANNED=$((SCANNED + 1))
+
+            # Get policy details
+            POLICY_INFO=$(aws iam get-policy --policy-arn "$POLICY_ARN" --output json --no-verify-ssl 2>/dev/null || echo '{}')
+            CREATE_DATE=$(echo "$POLICY_INFO" | jq -r '.Policy.CreateDate // ""')
+
+            if [ -z "$CREATE_DATE" ]; then
+              echo "::warning::Could not get creation date for policy: $POLICY_NAME"
+              continue
+            fi
+
+            CREATE_EPOCH=$(date -d "$CREATE_DATE" +%s 2>/dev/null || echo "0")
+            if [ "$CREATE_EPOCH" = "0" ]; then
+              echo "::warning::Could not parse creation date for policy: $POLICY_NAME"
+              continue
+            fi
+            AGE_DAYS=$(( (CURRENT_TIME - CREATE_EPOCH) / 86400 ))
+
+            echo "Found: $POLICY_NAME (age: $AGE_DAYS days)"
+
+            # Check tag if required
+            if [ "$REQUIRE_TAG" = "true" ]; then
+              TAGS=$(aws iam list-policy-tags --policy-arn "$POLICY_ARN" --output json --no-verify-ssl 2>&1 || echo "TAG_ERROR")
+
+              if echo "$TAGS" | grep -q "TAG_ERROR\|error\|Error\|not supported\|InvalidAction"; then
+                if [ "$TAG_CHECK_FAILED" = "false" ]; then
+                  echo "::warning::Tag check not supported in zCompute, falling back to naming convention only"
+                  echo "TAG_CHECK_FAILED=true" >> $GITHUB_ENV
+                fi
+                echo "Skipping $POLICY_NAME - require_tag is set but tag check not supported"
+                continue
+              fi
+
+              HAS_TAG=$(echo "$TAGS" | jq -r '.Tags[] | select(.Key == "managed-by" and .Value == "integration-test") | .Key' 2>/dev/null || echo "")
+              if [ -z "$HAS_TAG" ]; then
+                echo "Skipping $POLICY_NAME - does not have managed-by tag"
+                continue
+              fi
+            fi
+
+            # Check age threshold
+            if [ $AGE_DAYS -gt $MAX_AGE_DAYS ]; then
+              if [ "$DRY_RUN" = "true" ]; then
+                echo "Would delete: $POLICY_NAME (age: $AGE_DAYS days)"
+                echo "- Would delete: \`$POLICY_NAME\` (age: $AGE_DAYS days)" >> $GITHUB_STEP_SUMMARY
+              else
+                echo "Deleting policy: $POLICY_NAME"
+
+                # First, detach from all entities
+                ENTITIES=$(aws iam list-entities-for-policy --policy-arn "$POLICY_ARN" --output json --no-verify-ssl 2>/dev/null || echo '{}')
+
+                # Detach from roles
+                ROLE_NAMES=$(echo "$ENTITIES" | jq -r '.PolicyRoles[].RoleName // empty')
+                for ROLE_NAME in $ROLE_NAMES; do
+                  echo "  Detaching from role: $ROLE_NAME"
+                  aws iam detach-role-policy \
+                    --role-name "$ROLE_NAME" \
+                    --policy-arn "$POLICY_ARN" \
+                    --no-verify-ssl 2>/dev/null || true
+                done
+
+                # Detach from users
+                USER_NAMES=$(echo "$ENTITIES" | jq -r '.PolicyUsers[].UserName // empty')
+                for USER_NAME in $USER_NAMES; do
+                  echo "  Detaching from user: $USER_NAME"
+                  aws iam detach-user-policy \
+                    --user-name "$USER_NAME" \
+                    --policy-arn "$POLICY_ARN" \
+                    --no-verify-ssl 2>/dev/null || true
+                done
+
+                # Detach from groups
+                GROUP_NAMES=$(echo "$ENTITIES" | jq -r '.PolicyGroups[].GroupName // empty')
+                for GROUP_NAME in $GROUP_NAMES; do
+                  echo "  Detaching from group: $GROUP_NAME"
+                  aws iam detach-group-policy \
+                    --group-name "$GROUP_NAME" \
+                    --policy-arn "$POLICY_ARN" \
+                    --no-verify-ssl 2>/dev/null || true
+                done
+
+                # Delete the policy
+                if aws iam delete-policy --policy-arn "$POLICY_ARN" --no-verify-ssl 2>/dev/null; then
+                  echo "Deleted: $POLICY_NAME"
+                  echo "- Deleted: \`$POLICY_NAME\` (age: $AGE_DAYS days)" >> $GITHUB_STEP_SUMMARY
+                  DELETED=$((DELETED + 1))
+                else
+                  echo "::warning::Failed to delete policy: $POLICY_NAME"
+                  echo "ERRORS=$((ERRORS + 1))" >> $GITHUB_ENV
+                fi
+              fi
+            else
+              echo "Keeping: $POLICY_NAME (age: $AGE_DAYS days, threshold: $MAX_AGE_DAYS days)"
+            fi
+          done
+
+          # Update environment (note: while loop runs in subshell, need to handle this)
+          echo "POLICIES_SCANNED=$(echo "$POLICIES" | wc -l)" >> $GITHUB_ENV
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Write summary
+        if: always()
+        run: |
+          echo "### Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Resource Type | Scanned | Deleted |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------------|---------|---------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Instance Profiles | $PROFILES_SCANNED | $PROFILES_DELETED |" >> $GITHUB_STEP_SUMMARY
+          echo "| Roles | $ROLES_SCANNED | $ROLES_DELETED |" >> $GITHUB_STEP_SUMMARY
+          echo "| Policies | $POLICIES_SCANNED | ${POLICIES_DELETED:-0} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "$ERRORS" -gt 0 ]; then
+            echo "**Errors encountered:** $ERRORS" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$TAG_CHECK_FAILED" = "true" ]; then
+            echo "**Note:** Tag filtering was requested but is not supported by zCompute IAM API. Resources were identified by naming convention only." >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "**This was a dry run.** No resources were actually deleted." >> $GITHUB_STEP_SUMMARY
+            echo "To delete resources, run the workflow with dry_run=false." >> $GITHUB_STEP_SUMMARY
+          fi
