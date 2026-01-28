@@ -1,0 +1,25 @@
+# Checkov configuration for terraform-zcompute-iam-instance-profile module
+# Suppressions with documented rationale for security audit
+
+skip-check:
+  # IAM Policy Wildcards - User-Provided Content
+  # This module accepts policy contents as a variable (var.policy_contents)
+  # Rationale: Cannot validate user-provided policies at module level
+  # Users are responsible for their own policy compliance
+  # The module is a building block - policy content is the user's responsibility
+  # See aws_iam_policy.tf - policy attribute uses var.policy_contents
+  - CKV_AWS_111  # IAM write access without constraints
+  - CKV_AWS_356  # IAM policy with "*" resource
+
+  # IAM Role Trust Policy
+  # ec2.amazonaws.com is the standard principal for instance profiles
+  # Rationale: Required for EC2 instances to assume the role
+  # This is the correct and expected configuration for instance profiles
+  # See aws_iam_role.tf - assume_role_policy with ec2.amazonaws.com principal
+  - CKV_AWS_290  # IAM policy allows * principal (if flagged)
+
+  # Module Source References in Examples (if any examples exist)
+  # Examples use GitHub ref or local source for demonstration purposes
+  # Rationale: Examples show how users would reference the module
+  - CKV_TF_1    # Module source not using commit hash
+  - CKV_TF_2    # Module source not using version tag
