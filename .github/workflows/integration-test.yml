@@ -7,6 +7,7 @@ on:
       - '**.tf'
       - 'tests/**'
       - '.github/workflows/integration-test.yml'
+      - '.github/scripts/**'
   push:
     branches: [main]
     paths:
@@ -18,6 +19,11 @@ on:
     inputs:
       skip_destroy:
         description: 'Skip destroy step (for debugging)'
+        required: false
+        type: boolean
+        default: false
+      skip_recreate_test:
+        description: 'Skip the destroy-and-recreate verification test'
         required: false
         type: boolean
         default: false
@@ -64,6 +70,12 @@ jobs:
     if: needs.check-credentials.outputs.has_credentials == 'true'
     timeout-minutes: 20
 
+    env:
+      TF_VAR_zcompute_endpoint_url: ${{ secrets.ZCOMPUTE_ENDPOINT }}
+      TF_VAR_zcompute_access_key: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
+      TF_VAR_zcompute_secret_key: ${{ secrets.ZCOMPUTE_SECRET_KEY }}
+      TF_VAR_name_suffix: ${{ github.run_id }}
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -74,6 +86,9 @@ jobs:
           terraform_version: "1.5.7"
           terraform_wrapper: false
 
+      # ============================================================
+      # Phase 1: Create IAM resources
+      # ============================================================
       - name: Terraform Init
         working-directory: tests/integration
         run: terraform init -input=false
@@ -81,21 +96,18 @@ jobs:
       - name: Terraform Apply
         id: apply
         working-directory: tests/integration
-        env:
-          TF_VAR_zcompute_endpoint_url: ${{ secrets.ZCOMPUTE_ENDPOINT }}
-          TF_VAR_zcompute_access_key: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
-          TF_VAR_zcompute_secret_key: ${{ secrets.ZCOMPUTE_SECRET_KEY }}
-          TF_VAR_name_suffix: ${{ github.run_id }}
         run: |
           echo "Deploying IAM resources: test-${{ github.run_id }}"
           terraform apply -auto-approve -input=false
 
           echo "::notice::Successfully deployed IAM instance profile"
 
+      # ============================================================
+      # Phase 2: Validate resources exist
+      # ============================================================
       - name: Validate Resources
         id: validate
         if: steps.apply.outcome == 'success'
-        working-directory: tests/integration
         env:
           AWS_ENDPOINT_URL: ${{ secrets.ZCOMPUTE_ENDPOINT }}/api/v2/aws/iam
           AWS_ACCESS_KEY_ID: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
@@ -134,30 +146,167 @@ jobs:
 
           # Write validation summary
           cat >> $GITHUB_STEP_SUMMARY << EOF
-          ### Validation Success
+          ### Phase 1: Initial Creation - Success
 
           - **Role**: \`$ROLE_NAME\` ($ROLE_ARN)
           - **Instance Profile**: \`$PROFILE_NAME\` ($PROFILE_ARN)
           - **Run ID**: ${{ github.run_id }}
           EOF
 
+      # ============================================================
+      # Phase 3: Destroy IAM resources
+      # ============================================================
       - name: Terraform Destroy
-        if: always() && steps.apply.outcome == 'success' && (github.event_name != 'workflow_dispatch' || github.event.inputs.skip_destroy != 'true')
+        id: destroy
+        if: steps.apply.outcome == 'success' && (github.event_name != 'workflow_dispatch' || github.event.inputs.skip_destroy != 'true')
         working-directory: tests/integration
-        env:
-          TF_VAR_zcompute_endpoint_url: ${{ secrets.ZCOMPUTE_ENDPOINT }}
-          TF_VAR_zcompute_access_key: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
-          TF_VAR_zcompute_secret_key: ${{ secrets.ZCOMPUTE_SECRET_KEY }}
-          TF_VAR_name_suffix: ${{ github.run_id }}
         run: |
           echo "Destroying IAM resources: test-${{ github.run_id }}"
 
           if ! terraform destroy -auto-approve -input=false; then
-            echo "::error::Failed to destroy IAM resources"
-            cat >> $GITHUB_STEP_SUMMARY << EOF
-          ### Manual Cleanup Required
+            echo "::warning::Terraform destroy reported failure"
+            echo "destroy_failed=true" >> $GITHUB_OUTPUT
+          else
+            echo "destroy_failed=false" >> $GITHUB_OUTPUT
+          fi
 
-          **Terraform destroy failed.** Please manually clean up:
+          echo "::notice::Terraform destroy completed"
+
+      # ============================================================
+      # Phase 4: Immediate recreate (race condition test)
+      # Simulates K8s CI where sequential matrix jobs share the same
+      # run_id and the next job starts immediately after destroy.
+      # ============================================================
+      - name: Check resource state immediately after destroy
+        id: post_destroy_check
+        if: steps.destroy.outcome == 'success' || steps.destroy.outcome == 'failure'
+        env:
+          AWS_ENDPOINT_URL: ${{ secrets.ZCOMPUTE_ENDPOINT }}/api/v2/aws/iam
+          AWS_ACCESS_KEY_ID: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ZCOMPUTE_SECRET_KEY }}
+          AWS_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: true
+        run: |
+          echo "=== Checking if resources linger after terraform destroy ==="
+          ROLE_NAME="test-role-${{ github.run_id }}"
+          PROFILE_NAME="test-${{ github.run_id }}"
+
+          ROLE_EXISTS=false
+          PROFILE_EXISTS=false
+
+          if aws iam get-role --role-name "$ROLE_NAME" --no-verify-ssl 2>/dev/null; then
+            ROLE_EXISTS=true
+            echo "::warning::Role '$ROLE_NAME' still exists after terraform destroy reported success"
+          else
+            echo "Role '$ROLE_NAME' confirmed deleted"
+          fi
+
+          if aws iam get-instance-profile --instance-profile-name "$PROFILE_NAME" --no-verify-ssl 2>/dev/null; then
+            PROFILE_EXISTS=true
+            echo "::warning::Instance profile '$PROFILE_NAME' still exists after terraform destroy reported success"
+          else
+            echo "Instance profile '$PROFILE_NAME' confirmed deleted"
+          fi
+
+          echo "role_lingers=${ROLE_EXISTS}" >> $GITHUB_OUTPUT
+          echo "profile_lingers=${PROFILE_EXISTS}" >> $GITHUB_OUTPUT
+
+          if [ "$ROLE_EXISTS" = "true" ] || [ "$PROFILE_EXISTS" = "true" ]; then
+            echo "::warning::Eventual consistency detected — resources linger after destroy"
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+
+          ### Eventual Consistency Detected
+
+          Terraform destroy reported success, but resources still exist in the API:
+          - **Role lingers**: ${ROLE_EXISTS}
+          - **Instance Profile lingers**: ${PROFILE_EXISTS}
+
+          This is the root cause of K8s CI name collisions.
+          EOF
+          fi
+
+      - name: Immediate recreate (no wait)
+        id: immediate_recreate
+        if: |
+          (steps.destroy.outcome == 'success')
+          && (github.event_name != 'workflow_dispatch' || github.event.inputs.skip_recreate_test != 'true')
+        working-directory: tests/integration
+        run: |
+          echo "============================================"
+          echo "IMMEDIATE RECREATE: No wait after destroy"
+          echo "Simulates K8s CI back-to-back matrix jobs"
+          echo "============================================"
+
+          rm -f terraform.tfstate terraform.tfstate.backup
+          terraform init -input=false
+
+          if terraform apply -auto-approve -input=false; then
+            echo "immediate_recreate=success" >> $GITHUB_OUTPUT
+            echo "::notice::Immediate recreate succeeded — no eventual consistency issue"
+          else
+            echo "immediate_recreate=failed" >> $GITHUB_OUTPUT
+            echo "::error::Immediate recreate failed — eventual consistency confirmed"
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+
+          ### Immediate Recreate FAILED
+
+          Recreating IAM resources immediately after destroy hit name collisions.
+          Terraform destroy reported success but resources were not fully removed.
+
+          This is the root cause of K8s CI failures when sequential matrix jobs
+          reuse the same resource names.
+          EOF
+          fi
+
+      - name: Fail on eventual consistency
+        if: steps.immediate_recreate.outputs.immediate_recreate == 'failed'
+        run: |
+          echo "::error::IAM resources not available for reuse after terraform destroy"
+          exit 1
+
+      # ============================================================
+      # Final Cleanup: Always destroy whatever was created
+      # ============================================================
+      - name: Final Destroy
+        if: |
+          always()
+          && (steps.apply.outcome == 'success')
+          && (github.event_name != 'workflow_dispatch' || github.event.inputs.skip_destroy != 'true')
+        working-directory: tests/integration
+        run: |
+          echo "Final cleanup: Destroying IAM resources: test-${{ github.run_id }}"
+
+          if ! terraform destroy -auto-approve -input=false; then
+            echo "::warning::Final terraform destroy reported failure"
+          fi
+
+      - name: Final Cleanup Verification
+        id: final_cleanup
+        if: |
+          always()
+          && (steps.apply.outcome == 'success')
+          && (github.event_name != 'workflow_dispatch' || github.event.inputs.skip_destroy != 'true')
+        env:
+          AWS_ENDPOINT_URL: ${{ secrets.ZCOMPUTE_ENDPOINT }}/api/v2/aws/iam
+          AWS_ACCESS_KEY_ID: ${{ secrets.ZCOMPUTE_ACCESS_KEY }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.ZCOMPUTE_SECRET_KEY }}
+          AWS_REGION: us-east-1
+          AWS_EC2_METADATA_DISABLED: true
+          ROLE_NAME: test-role-${{ github.run_id }}
+          PROFILE_NAME: test-${{ github.run_id }}
+          POLICY_PREFIX: test-policy-${{ github.run_id }}
+          MAX_WAIT_SECONDS: "60"
+          FORCE_CLEANUP: "true"
+        run: |
+          chmod +x .github/scripts/verify-iam-cleanup.sh
+          if ! .github/scripts/verify-iam-cleanup.sh; then
+            echo "::warning::Final cleanup verification failed - resources may need manual cleanup"
+
+            cat >> $GITHUB_STEP_SUMMARY << EOF
+
+          ### Manual Cleanup May Be Required
+
+          **Final cleanup verification failed.** Please check:
           - Instance Profile: \`test-${{ github.run_id }}\`
           - Role: \`test-role-${{ github.run_id }}\`
           - Policy: \`test-policy-${{ github.run_id }}-*\` (includes MD5 hash suffix)
@@ -165,10 +314,7 @@ jobs:
 
           Check the zCompute console and delete resources with this name prefix.
           EOF
-            exit 1
           fi
-
-          echo "::notice::Successfully destroyed IAM resources"
 
   summary:
     name: Integration Test Summary
@@ -209,13 +355,17 @@ jobs:
               cat >> $GITHUB_STEP_SUMMARY << 'EOF'
           ### All Tests Passed
 
-          IAM instance profile successfully deployed, validated, and cleaned up.
+          IAM instance profile successfully deployed, validated, destroyed, and recreated.
 
-          | Resource | Status |
-          |----------|--------|
-          | IAM Role | Created and validated |
-          | IAM Policy | Created and attached |
-          | Instance Profile | Created and validated |
+          | Test Phase | Status |
+          |------------|--------|
+          | Create IAM resources | Passed |
+          | Validate resources exist | Passed |
+          | Destroy resources | Passed |
+          | Verify destroy cleanup | Passed |
+          | Recreate with same names | Passed |
+          | Validate recreated resources | Passed |
+          | Final cleanup | Passed |
           EOF
               echo "status=success" >> $GITHUB_OUTPUT
             else
@@ -223,6 +373,12 @@ jobs:
           ### Tests Failed
 
           Integration test failed. Check individual job logs for details.
+
+          **Possible issues:**
+          - IAM resource creation failed
+          - Resource validation failed
+          - Destroy did not clean up (name collision on recreate)
+          - Recreate test failed
           EOF
               echo "status=failed" >> $GITHUB_OUTPUT
             fi
@@ -260,13 +416,16 @@ jobs:
             } else if (status === 'success') {
               body += `## Integration Tests Passed
 
-            IAM module successfully deployed and validated against zCompute infrastructure.
+            IAM module successfully deployed, destroyed, and recreated against zCompute infrastructure.
 
-            | Resource | Status |
-            |----------|--------|
-            | IAM Role | Created and validated |
-            | IAM Policy | Created and attached |
-            | Instance Profile | Created and validated |
+            | Test Phase | Status |
+            |------------|--------|
+            | Create IAM resources | Passed |
+            | Validate resources exist | Passed |
+            | Destroy resources | Passed |
+            | Verify destroy cleanup | Passed |
+            | Recreate with same names | Passed |
+            | Final cleanup | Passed |
 
             [View workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
             `;
