@@ -17,9 +17,10 @@ resource "aws_iam_role" "this" {
   force_detach_policies = true
   assume_role_policy    = var.role_contents != null ? jsonencode(var.role_contents) : data.aws_iam_policy_document.role.json
 
+  depends_on = [null_resource.destroy_waiter]
+
   #Not supported by zCompute
   #tags = var.tags
-  depends_on = [aws_iam_policy.this, data.aws_iam_policy.this]
 }
 
 

@@ -10,12 +10,13 @@ resource "aws_iam_policy" "this" {
   path        = var.policy_path
   description = try(var.policy_description, "Policy for iam role ${var.role_name}")
   policy      = var.policy_contents != null ? jsonencode(var.policy_contents) : data.aws_iam_policy_document.policy.json
+
+  depends_on = [null_resource.destroy_waiter]
 }
 
-resource "aws_iam_policy_attachment" "this" {
+resource "aws_iam_role_policy_attachment" "this" {
   count      = var.use_existing_policy ? 0 : 1
-  name       = join("-", [local.policy_name, "policy-attachment"])
-  roles      = var.use_existing_role ? [data.aws_iam_role.this[count.index].name] : [aws_iam_role.this[count.index].name]
+  role       = var.use_existing_role ? data.aws_iam_role.this[count.index].name : aws_iam_role.this[count.index].name
   policy_arn = var.use_existing_policy ? data.aws_iam_policy.this[count.index].arn : aws_iam_policy.this[count.index].arn
 }
 
