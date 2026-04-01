@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.1.1](https://github.com/zadarastorage/terraform-zcompute-iam-instance-profile/compare/v1.1.0...v1.1.1) (2026-04-01)
+
+
+### Bug Fixes
+
+* **iam:** add destroy-time polling and switch to role_policy_attachment ([42b004c](https://github.com/zadarastorage/terraform-zcompute-iam-instance-profile/commit/42b004c333777db6d9b331a768b7f6ed5faf96c2))
+* **iam:** add destroy-time polling and switch to role_policy_attachment ([dd5fa55](https://github.com/zadarastorage/terraform-zcompute-iam-instance-profile/commit/dd5fa55f1d7cafdcf5966b5f89b1f0394c6e00ac))
+* **iam:** improve destroy hygiene and add consistency delay ([18138e3](https://github.com/zadarastorage/terraform-zcompute-iam-instance-profile/commit/18138e3e146712ba95a7938392bc9074ce53fc82))
+
+
+### Documentation
+
+* update terraform-docs generated content ([6123147](https://github.com/zadarastorage/terraform-zcompute-iam-instance-profile/commit/6123147c84d9be5698734b8b931757cfa659fb1b))
+
 ## [1.1.0](https://github.com/zadarastorage/terraform-zcompute-iam-instance-profile/compare/v1.0.0...v1.1.0) (2026-01-28)
 
 
