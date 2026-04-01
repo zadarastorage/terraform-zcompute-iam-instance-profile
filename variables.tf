@@ -69,6 +69,28 @@ variable "policy_arn" {
   nullable    = true
 }
 
+variable "create_delay_seconds" {
+  description = <<-EOT
+    Seconds to wait before creating IAM resources. Use when a prior
+    destroy did not include a destroy delay — the IAM API may reject
+    create calls with "already used" for several minutes after delete.
+  EOT
+  type        = number
+  default     = 0
+}
+
+variable "destroy_delay_seconds" {
+  description = <<-EOT
+    Seconds to wait after destroying IAM resources before terraform
+    exits. Gives the backend time to fully purge deleted resources
+    so the names are immediately reusable on the next apply.
+    Default: 360 (6 minutes), based on measured eventual consistency
+    window of 3-6 minutes on zCompute.
+  EOT
+  type        = number
+  default     = 360
+}
+
 #variable "tags" {
 #  description = "A map of tags to add to all resources"
 #  type        = map(string)
