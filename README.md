@@ -155,6 +155,7 @@ See the terraform-docs generated sections below for detailed requirements, provi
 | Name | Version |
 |------|---------|
 | <a name="provider_aws"></a> [aws](#provider\_aws) | >= 3.33.0, <= 4.34.0 |
+| <a name="provider_time"></a> [time](#provider\_time) | n/a |
 
 ## Resources
 
@@ -164,8 +165,9 @@ See the terraform-docs generated sections below for detailed requirements, provi
 |------|------|
 | [aws_iam_instance_profile.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_instance_profile) | resource |
 | [aws_iam_policy.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy) | resource |
-| [aws_iam_policy_attachment.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_policy_attachment) | resource |
 | [aws_iam_role.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role) | resource |
+| [aws_iam_role_policy_attachment.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/resources/iam_role_policy_attachment) | resource |
+| [time_sleep.consistency_delay](https://registry.terraform.io/providers/hashicorp/time/latest/docs/resources/sleep) | resource |
 | [aws_iam_policy.this](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy) | data source |
 | [aws_iam_policy_document.policy](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
 | [aws_iam_policy_document.role](https://registry.terraform.io/providers/hashicorp/aws/latest/docs/data-sources/iam_policy_document) | data source |
@@ -177,6 +179,8 @@ See the terraform-docs generated sections below for detailed requirements, provi
 
 | Name | Description | Type | Default | Required |
 |------|-------------|------|---------|:--------:|
+| <a name="input_create_delay_seconds"></a> [create\_delay\_seconds](#input\_create\_delay\_seconds) | Seconds to wait before creating IAM resources. Use when a prior<br/>destroy did not include a destroy delay — the IAM API may reject<br/>create calls with "already used" for several minutes after delete. | `number` | `0` | no |
+| <a name="input_destroy_delay_seconds"></a> [destroy\_delay\_seconds](#input\_destroy\_delay\_seconds) | Seconds to wait after destroying IAM resources before terraform<br/>exits. Gives the backend time to fully purge deleted resources<br/>so the names are immediately reusable on the next apply.<br/>Default: 360 (6 minutes), based on measured eventual consistency<br/>window of 3-6 minutes on zCompute. | `number` | `360` | no |
 | <a name="input_instance_profile_path"></a> [instance\_profile\_path](#input\_instance\_profile\_path) | IAM Instance Profile Path | `string` | `"/"` | no |
 | <a name="input_name"></a> [name](#input\_name) | Instance profile name | `string` | n/a | yes |
 | <a name="input_policy_arn"></a> [policy\_arn](#input\_policy\_arn) | ARN to an existing policy to use | `string` | `null` | no |
