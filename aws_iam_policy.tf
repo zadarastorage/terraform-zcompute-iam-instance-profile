@@ -11,7 +11,10 @@ resource "aws_iam_policy" "this" {
   description = try(var.policy_description, "Policy for iam role ${var.role_name}")
   policy      = var.policy_contents != null ? jsonencode(var.policy_contents) : data.aws_iam_policy_document.policy.json
 
-  depends_on = [null_resource.destroy_waiter]
+  # Policy must be destroyed AFTER the role — force_detach_policies on the
+  # role detaches policies during role deletion, and parallel destroy of
+  # role+policy causes race conditions on zCompute.
+  depends_on = [aws_iam_role.this, time_sleep.consistency_delay]
 }
 
 resource "aws_iam_role_policy_attachment" "this" {

@@ -30,4 +30,7 @@ module "iam_instance_profile" {
       }
     ]
   }
+
+  create_delay_seconds  = coalesce(var.create_delay_seconds, 0)
+  destroy_delay_seconds = coalesce(var.destroy_delay_seconds, 360)
 }
